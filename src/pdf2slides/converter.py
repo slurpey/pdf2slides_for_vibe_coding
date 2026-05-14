@@ -503,8 +503,8 @@ class Converter:
             dashes=drawing.get("dashes"),
             even_odd=drawing.get("even_odd", True),
             closePath=drawing.get("closePath", True),
-            fill_opacity=drawing.get("fill_opacity", 1),
-            stroke_opacity=drawing.get("stroke_opacity", 1),
+            fill_opacity=drawing.get("fill_opacity") or 1,
+            stroke_opacity=drawing.get("stroke_opacity") or 1,
         )
 
         image_bytes = temp_page.get_pixmap().tobytes("png")
