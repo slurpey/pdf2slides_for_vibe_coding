@@ -1,9 +1,10 @@
 import io
 import os.path
+import re
 
 import numpy as np
 import pymupdf
-from paddleocr import PaddleOCR, PPStructure
+from paddleocr import PaddleOCR, PPStructureV3 as PPStructure
 from PIL import Image
 from pptx import Presentation, presentation
 from pptx.dml.color import RGBColor
@@ -89,7 +90,7 @@ class Converter:
             )
 
         output_directory = os.path.dirname(output_file_path)
-        if not os.path.exists(output_directory):
+        if output_directory and not os.path.exists(output_directory):
             os.makedirs(output_directory)
 
         # Save PowerPoint presentation
@@ -138,60 +139,149 @@ class Converter:
         ocr_result = self.ocr.ocr(page_bytes, cls=False)
         return ocr_result
 
-    def _add_text_block_to_slide(self, text_block: dict, slide: Slide) -> None:
-        """Add all text in the block to a slide. Output font properties will follow those found in the original file."""
+    @staticmethod
+    def _readable_font_name(raw_name: str, fallback: str) -> str:
+        """Clean up PyMuPDF font names like 'Type3 (179 0 R)' or 'ABCDEF+Calibri'."""
+        cleaned = raw_name
+        # Remove embedded object references: "Type3 (179 0 R)" → "Type3"
+        cleaned = re.sub(r'\s*\(\d+\s+\d+\s+R\)\s*$', '', cleaned)
+        # Remove prefix hex garbage: "ABCDEF+Calibri" → "Calibri"
+        cleaned = re.sub(r'^[A-F0-9]{6}\+', '', cleaned)
+        # Generic type names get the fallback
+        if cleaned.lower().startswith('type'):
+            return fallback
+        return cleaned
 
+    @staticmethod
+    def _detect_alignment(text_block: dict) -> int:
+        """Detect text alignment from span positions within the block."""
+        block_x0, _, block_x1, _ = text_block["bbox"]
+        block_width = block_x1 - block_x0
+        if block_width <= 0:
+            return PP_ALIGN.LEFT
+
+        total_margin = 0.0
+        count = 0
         for line in text_block["lines"]:
             for span in line["spans"]:
-                # Extract text content and font size from each span
-                line_text = span["text"]
-                line_font_size = span["size"]
-                # The font size is too small, will raise an error when added to slide
-                if line_font_size < 1:
-                    continue
-                line_font_name = span["font"]
-                line_font_color = span["color"]
-                line_font_is_italic = bool(span["flags"] & 2**1)
-                line_font_is_bold = bool(span["flags"] & 2**4)
+                sx0 = span["bbox"][0]
+                # Normalised left margin: 0 = block left, 1 = block right
+                margin = (sx0 - block_x0) / block_width
+                total_margin += margin
+                count += 1
 
-                # Extract position of the span
-                x0, y0, x1, y1 = span["bbox"]
+        if count == 0:
+            return PP_ALIGN.LEFT
 
-                # Calculate position on the slide
-                # Convert from points to inches (1 point = 1/72 inch)
-                text_box_left = Inches(x0 / 72.0)
-                text_box_top = Inches(y0 / 72.0)
-                text_box_width = Inches((x1 - x0) / 72.0)
-                text_box_height = Inches((y1 - y0) / 72.0)
+        avg_margin = total_margin / count
+        # If spans are significantly inset from the left edge → right-aligned
+        if avg_margin > 0.3:
+            return PP_ALIGN.RIGHT
+        return PP_ALIGN.LEFT
 
-                # Add text box to the slide
-                new_text_box = slide.shapes.add_textbox(
-                    text_box_left, text_box_top, text_box_width, text_box_height
-                )
+    def _add_text_block_to_slide(self, text_block: dict, slide: Slide) -> None:
+        """Add all text in the block to a single text box.
 
-                text_frame = new_text_box.text_frame
-                # Centers text vertically. Necessary for placing mathematical formulae in Beamer at desired locations.
-                text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+        One box per block, one paragraph per line, one run per span.
+        This replaces the original approach of one box per span.
+        """
+        if not text_block.get("lines"):
+            return
 
-                # Set the margin to 0 to visually mimic original layout
-                text_frame.margin_bottom = 0
-                text_frame.margin_left = 0
-                text_frame.margin_right = 0
-                text_frame.margin_top = 0
+        # Block bounding box (PDF points)
+        bx0, by0, bx1, by1 = text_block["bbox"]
+        if bx1 - bx0 < 1 or by1 - by0 < 1:
+            return
 
+        # Calculate position on the slide (points → inches)
+        text_box_left = Inches(bx0 / 72.0)
+        text_box_top = Inches(by0 / 72.0)
+        text_box_width = Inches((bx1 - bx0) / 72.0)
+        text_box_height = Inches((by1 - by0) / 72.0)
+
+        # Add single text box for the whole block
+        new_text_box = slide.shapes.add_textbox(
+            text_box_left, text_box_top, text_box_width, text_box_height
+        )
+
+        text_frame = new_text_box.text_frame
+        text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+        text_frame.margin_bottom = 0
+        text_frame.margin_left = 0
+        text_frame.margin_right = 0
+        text_frame.margin_top = 0
+        text_frame.word_wrap = True
+
+        # Determine alignment from block geometry (right-aligned page numbers, etc.)
+        alignment = self._detect_alignment(text_block)
+
+        lines = text_block["lines"]
+        fallback_font = (
+            self.default_font if self.default_font else "Calibri"
+        )
+
+        for li, line in enumerate(lines):
+            if li == 0:
                 p = text_frame.paragraphs[0]
-                p.text = line_text
-                p.font.size = Pt(line_font_size)
-                p.font.name = (
+            else:
+                p = text_frame.add_paragraph()
+
+            p.alignment = alignment
+
+            # Infer spacing from PDF line positions
+            if li > 0:
+                prev_line = lines[li - 1]
+                prev_bottom = prev_line["bbox"][3]
+                this_top = line["bbox"][1]
+                line_gap = this_top - prev_bottom
+                # Calculate max font size on this line for relative spacing
+                max_size = max(
+                    (s["size"] for s in line["spans"] if s["size"] >= 1),
+                    default=12,
+                )
+                if max_size > 0 and line_gap > 0:
+                    # Set space_before to replicate PDF line spacing
+                    p.space_before = Pt(line_gap)
+
+            # Add spans as runs within the paragraph
+            for si, span in enumerate(line["spans"]):
+                span_text = span["text"]
+                span_font_size = span["size"]
+
+                if not span_text or span_font_size < 1:
+                    continue
+
+                span_font_name = span["font"]
+                span_font_color = span["color"]
+                span_font_is_italic = bool(span["flags"] & 2**1)
+                span_font_is_bold = bool(span["flags"] & 2**4)
+
+                # Reuse existing run for first span, add new ones after
+                if si == 0 and p.runs:
+                    run = p.runs[0]
+                else:
+                    run = p.add_run()
+
+                run.text = span_text
+                run.font.size = Pt(span_font_size)
+
+                # Apply font name (cleaned from Type3 / hex prefixes)
+                run.font.name = (
                     self.default_font
                     if self.enforce_default_font and self.default_font
-                    else line_font_name
+                    else self._readable_font_name(span_font_name, fallback_font)
                 )
-                # BUG: Text with gradient color will become black
-                p.font.color.rgb = RGBColor.from_string(f"{line_font_color:06X}")
-                p.font.italic = line_font_is_italic
-                p.font.bold = line_font_is_bold
-                p.alignment = PP_ALIGN.LEFT
+
+                # Apply colour (skip gradient cases that turn black)
+                try:
+                    run.font.color.rgb = RGBColor.from_string(
+                        f"{span_font_color:06X}"
+                    )
+                except (ValueError, AttributeError):
+                    pass
+
+                run.font.italic = span_font_is_italic
+                run.font.bold = span_font_is_bold
 
     def _add_image_to_slide(
         self,
