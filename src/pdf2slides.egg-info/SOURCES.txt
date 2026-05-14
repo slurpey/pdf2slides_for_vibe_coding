@@ -1,0 +1,10 @@
+LICENSE
+README.md
+setup.py
+src/pdf2slides/__init__.py
+src/pdf2slides/converter.py
+src/pdf2slides.egg-info/PKG-INFO
+src/pdf2slides.egg-info/SOURCES.txt
+src/pdf2slides.egg-info/dependency_links.txt
+src/pdf2slides.egg-info/requires.txt
+src/pdf2slides.egg-info/top_level.txt

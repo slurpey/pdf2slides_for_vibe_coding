@@ -1,56 +1,68 @@
+"""PDF to PPTX Converter"""
+
 import io
-import os.path
+import math
+import os
 import re
+from collections import defaultdict
 
 import numpy as np
 import pymupdf
-from paddleocr import PaddleOCR, PPStructureV3 as PPStructure
-from PIL import Image
-from pptx import Presentation, presentation
+from pptx import Presentation
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.dml.color import RGBColor
-from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
-from pptx.slide import Slide
 from pptx.util import Inches, Pt
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import GridSearchCV
 
 
 class Converter:
+    """Convert a PDF file to a PowerPoint file."""
+
+    # Tolerance values in points (1 inch = 72 points)
+    COLUMN_GAP_THRESHOLD = 13.2  # ~0.183" — min gap to detect separate columns
+    SAME_BOX_GAP = 5.3           # ~0.074" — max vertical gap within same text box
+    SAME_PARA_GAP = 2.6          # ~0.036" — max gap within same paragraph (wrapped text)
+    MIN_INDENT = 0.35            # ~0.005" — min indent for sub-level detection
 
     def __init__(
         self,
-        default_font: str | None = None,
         enable_ocr: bool = False,
+        default_font: str | None = None,
         enforce_default_font: bool = False,
-        image_retention_level: float = 1.0,
-        lang: str = "ch",
     ) -> None:
-        """
+        """Initialize the converter.
+
         Args:
-            default_font: This is the font that will be used for OCR'ed text. Does not have any effect if the font is not already installed in the computer.
-            enable_ocr: Whether the OCR will be used. Defaults to `False`.
-            enforce_default_font: If `true`, use the default font even when OCR is not enabled. Otherwise, use the font detected in the original PDF file. Defaults to `False`.
-            image_retention_level: Determines how likely pure-text images will be kept. Has no effect when not in OCR mode. This is internally passed to PaddleOCR as the `layout_score_threshold` parameter. Defaults to `1.0`.
-            lang: The abbreviation of the language used by the PaddleOCR. Defaults to `ch`, which supports both Chinese and English. For a full list of supported languages, please refer to https://github.com/PaddlePaddle/PaddleOCR/blob/main/doc/doc_en/multi_languages_en.md.
+            enable_ocr: Whether to use OCR when extracting text.
+            default_font: The font to use for all text.
+            enforce_default_font: Whether to enforce the default font.
         """
-
-        self.default_font = default_font
         self.enable_ocr = enable_ocr
+        self.default_font = default_font
         self.enforce_default_font = enforce_default_font
+        self.ocr = None
 
-        self.ocr = PaddleOCR(lang=lang, show_log=False) if self.enable_ocr else None
-        self.layout_engine = (
-            PPStructure(
-                table=False,
-                ocr=False,
-                layout_score_threshold=image_retention_level,
+        if self.enable_ocr:
+            from paddleocr import PaddleOCR
+
+            self.ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+
+    @staticmethod
+    def _validate_arguments(input_file_path: str, output_file_path: str) -> None:
+        """Validate the input arguments."""
+
+        if not os.path.exists(input_file_path):
+            raise FileNotFoundError(
+                "Input file '{}' does not exist".format(input_file_path)
             )
-            if self.enable_ocr
-            else None
-        )
+
+        output_directory = os.path.dirname(output_file_path)
+        if output_directory and not os.path.exists(output_directory):
+            os.makedirs(output_directory)
 
     def convert(self, input_file_path: str, output_file_path: str) -> None:
-        """Convert a .pdf file to a .pptx file.
+        """Convert a PDF to a PowerPoint.
 
         Args:
             input_file_path: The path of the input `.pdf` file.
@@ -179,11 +191,132 @@ class Converter:
             return PP_ALIGN.RIGHT
         return PP_ALIGN.LEFT
 
-    def _add_text_block_to_slide(self, text_block: dict, slide: Slide) -> None:
+    # ------------------------------------------------------------------
+    # Block merging (to fix pymupdf splitting paragraphs into separate blocks)
+    # ------------------------------------------------------------------
+
+    def _merge_text_blocks(self, text_blocks: list[dict]) -> list[dict]:
+        """Merge adjacent blocks that belong together into one text box.
+
+        Strategy:
+        1. Cluster blocks into columns by x-position
+        2. Within each column, merge vertically adjacent blocks (small gap)
+        3. Return merged blocks
+        """
+        if not text_blocks:
+            return []
+
+        # Sort by y-position (top-to-bottom)
+        sorted_blocks = sorted(text_blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+
+        # Cluster into columns by x-position
+        columns = self._cluster_columns(sorted_blocks)
+
+        # Merge adjacent blocks within each column
+        merged = []
+        for col in columns:
+            col_sorted = sorted(col, key=lambda b: b["bbox"][1])
+            groups = self._group_adjacent(col_sorted)
+            for group in groups:
+                merged_block = self._combine_blocks(group)
+                if merged_block:
+                    merged.append(merged_block)
+
+        return merged
+
+    def _cluster_columns(self, blocks: list[dict]) -> list[list[dict]]:
+        """Group blocks into columns by x-position clustering."""
+        if not blocks:
+            return []
+
+        # Get center x of each block
+        block_xs = []
+        for b in blocks:
+            x0, _, x1, _ = b["bbox"]
+            cx = (x0 + x1) / 2.0
+            block_xs.append(cx)
+
+        # Sort unique x positions
+        unique_xs = sorted(set(round(cx / 3.0) * 3.0 for cx in block_xs))
+
+        # Cluster
+        clusters = []
+        current = [unique_xs[0]]
+        for x in unique_xs[1:]:
+            if x - current[-1] < self.COLUMN_GAP_THRESHOLD:
+                current.append(x)
+            else:
+                clusters.append((min(current), max(current)))
+                current = [x]
+        clusters.append((min(current), max(current)))
+
+        # Assign each block to the nearest cluster
+        result = [[] for _ in clusters]
+        for block in blocks:
+            x0, _, x1, _ = block["bbox"]
+            cx = (x0 + x1) / 2.0
+            best_idx = 0
+            best_dist = float("inf")
+            for i, (cmin, cmax) in enumerate(clusters):
+                cc = (cmin + cmax) / 2.0
+                d = abs(cx - cc)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            result[best_idx].append(block)
+
+        return result
+
+    def _group_adjacent(self, blocks: list[dict]) -> list[list[dict]]:
+        """Group vertically adjacent blocks within a column."""
+        if not blocks:
+            return []
+
+        groups = [[blocks[0]]]
+        for block in blocks[1:]:
+            prev_bottom = groups[-1][-1]["bbox"][3]
+            this_top = block["bbox"][1]
+            gap = this_top - prev_bottom
+            if gap < self.SAME_BOX_GAP:
+                groups[-1].append(block)
+            else:
+                groups.append([block])
+        return groups
+
+    def _combine_blocks(self, blocks: list[dict]) -> dict | None:
+        """Combine a list of blocks into one merged block with all lines."""
+        if not blocks:
+            return None
+
+        if len(blocks) == 1:
+            return blocks[0]
+
+        # Compute combined bbox
+        x0 = min(b["bbox"][0] for b in blocks)
+        y0 = min(b["bbox"][1] for b in blocks)
+        x1 = max(b["bbox"][2] for b in blocks)
+        y1 = max(b["bbox"][3] for b in blocks)
+
+        # Collect all lines in order
+        all_lines = []
+        for block in blocks:
+            all_lines.extend(block["lines"])
+
+        merged = {
+            "type": 0,
+            "bbox": (x0, y0, x1, y1),
+            "lines": all_lines,
+        }
+        return merged
+
+    # ------------------------------------------------------------------
+    # Text box creation
+    # ------------------------------------------------------------------
+
+    def _add_text_block_to_slide(self, text_block: dict, slide) -> None:
         """Add all text in the block to a single text box.
 
         One box per block, one paragraph per line, one run per span.
-        This replaces the original approach of one box per span.
         """
         if not text_block.get("lines"):
             return
@@ -289,7 +422,7 @@ class Converter:
         image: dict,
         smask: int,
         bbox: pymupdf.Rect,
-        slide: Slide,
+        slide,
     ) -> None:
         """Add the image to a slide."""
 
@@ -331,7 +464,7 @@ class Converter:
         bbox: pymupdf.Rect,
         pdf_page_width: float,
         pdf_page_height: float,
-        slide: Slide,
+        slide,
     ) -> None:
         """Add all drawings to a slide.
 
@@ -354,57 +487,41 @@ class Converter:
                 shape.draw_quad(item[1])
             elif item[0] == "c":  # curve
                 shape.draw_bezier(item[1], item[2], item[3], item[4])
-
-        keys = [
-            "fill",
-            "color",
-            "dashes",
-            "even_odd",
-            "closePath",
-            "lineJoin",
-            "width",
-            "stroke_opacity",
-            "fill_opacity",
-        ]
-        kwargs_defaults = {
-            "even_odd": True,
-            "closePath": True,
-            "lineJoin": 0,
-            "width": 1,
-            "stroke_opacity": 1,
-            "fill_opacity": 1,
-        }
-        kwargs = {
-            key: (
-                drawing.get(key)
-                if drawing.get(key) is not None
-                else kwargs_defaults.get(key)
-            )
-            for key in keys
-        }
-        kwargs["lineCap"] = (
-            max(drawing.get("lineCap")) if drawing.get("lineCap") is not None else 0
+            elif item[0] == "cu":  # curve
+                shape.draw_curve(item[1], item[2], item[3])
+            elif item[0] == "o":  # circle/ellipse
+                if item[1] == 1:
+                    shape.draw_circle(item[2], item[3])
+                else:
+                    shape.draw_oval(item[2], item[3])
+            elif item[0] == "s":  # section of circle/elipse
+                shape.draw_sector(item[1], item[2], item[3])
+        shape.finish(
+            fill=drawing.get("fill"),
+            color=drawing.get("color"),
+            width=drawing.get("width"),
+            dashes=drawing.get("dashes"),
+            even_odd=drawing.get("even_odd", True),
+            closePath=drawing.get("closePath", True),
+            fill_opacity=drawing.get("fill_opacity", 1),
+            stroke_opacity=drawing.get("stroke_opacity", 1),
         )
-        shape.finish(**kwargs)
-        shape.commit()
 
-        base_image = temp_page.get_pixmap(clip=bbox, dpi=300, alpha=True)
+        image_bytes = temp_page.get_pixmap().tobytes("png")
+
+        # Calculate position on the slide based on original PDF coordinates
+        left = Inches(bbox[0] / 72.0)
+        top = Inches(bbox[1] / 72.0)
+        width = Inches((bbox[2] - bbox[0]) / 72.0)
+
         try:
-            # The image has .png format by default
-            image_bytes = base_image.tobytes()
-
-            # Calculate position on the slide based on original PDF coordinates
-            left = Inches(bbox[0] / 72.0)
-            top = Inches(bbox[1] / 72.0)
-            width = Inches((bbox[2] - bbox[0]) / 72.0)
-
-            # Add image to the PowerPoint slide
+            # Add drawing to the PowerPoint slide
             slide.shapes.add_picture(io.BytesIO(image_bytes), left, top, width=width)
         except:
             # Something went wrong. Ignore this drawing.
             pass
 
-    def _add_ocr_to_slide(self, ocr_line: list, fontsize: float, slide: Slide) -> None:
+    def _add_ocr_to_slide(self, ocr_line: list, fontsize: float, slide) -> None:
         """Add all text obtained from ocr to a slide."""
 
         # Since the input pixmap has dpi=300 rather than dpi=72 by default, we need to set the scaling factor as 72/300 = 0.24
@@ -446,7 +563,7 @@ class Converter:
         self,
         pdf_document: pymupdf.Document,
         all_contents: list[dict],
-        pptx_output: presentation.Presentation,
+        pptx_output: Presentation,
         scanned_document: bool,
     ) -> None:
         """Construct output slides with scanned PDF file."""
@@ -513,8 +630,12 @@ class Converter:
             # Iterate through text blocks and add them to the slide
             # NOTE: We add text blocks to slides AFTER we add images in order that they appear in front of the images.
             text_blocks: list[dict] = page_content["text_blocks"]
-            for text_block in text_blocks:
-                self._add_text_block_to_slide(text_block, slide)
+
+            # NEW: Merge adjacent blocks before creating text boxes
+            merged_blocks = self._merge_text_blocks(text_blocks)
+
+            for merged_block in merged_blocks:
+                self._add_text_block_to_slide(merged_block, slide)
 
             if scanned_document:
                 page_ocr_results = ocr_results[page_num]
